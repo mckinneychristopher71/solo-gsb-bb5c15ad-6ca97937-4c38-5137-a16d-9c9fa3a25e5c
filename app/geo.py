@@ -67,6 +67,24 @@ def _coordinate(value: Any, field: str, label: str) -> float:
     return result
 
 
+def cell_bounds(z: int, x: int, y: int) -> tuple[float, float, float, float]:
+    """返回层级 z 的 (x, y) 格边界 ``(lat_min, lat_max, lon_min, lon_max)``。
+
+    与本模块递归四分同一套网格：根格覆盖 -90～90、-180～180，按经纬中点
+    逐层对分，y 向北为 0；z 层格宽 ``360/2^z``、格高 ``180/2^z``。
+    z <= MAX_ZOOM_LIMIT 时格边都是 2 的幂次等分点（分母至多 2^12），
+    以下浮点运算不产生舍入，结果与递归取中点逐格传递的边界完全一致。
+    """
+    n = 1 << z
+    lon_span = 360.0 / n
+    lat_span = 180.0 / n
+    lon_min = ROOT_LON_MIN + x * lon_span
+    lon_max = lon_min + lon_span
+    lat_max = ROOT_LAT_MAX - y * lat_span
+    lat_min = lat_max - lat_span
+    return lat_min, lat_max, lon_min, lon_max
+
+
 def assign_cells(
     lats: list[float],
     lons: list[float],

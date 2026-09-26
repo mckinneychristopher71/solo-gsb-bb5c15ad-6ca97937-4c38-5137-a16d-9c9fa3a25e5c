@@ -5,10 +5,11 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from fastapi import FastAPI
-from pydantic import BaseModel, ConfigDict, Field, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from .anonymizer import (
     apply_levels,
@@ -18,6 +19,7 @@ from .anonymizer import (
     unprocessable,
 )
 from .geo import MAX_ZOOM_LIMIT, assign_cells, prepare_points
+from .geo_bounds import count_bounds, prepare_cells
 from .intersection import audit_intersections
 from .spacetime import assign_joint
 from .time_windows import MAX_WINDOW_HOURS_LIMIT, assign_windows, prepare_records
@@ -42,8 +44,12 @@ app = FastAPI(
         "对齐、宽度整除 24 且不超过上限的等宽小时窗组成联合组，"
         "枚举可行的 (z, 宽度)，仅保留每个非空联合组至少 k 条的方案，"
         "最大化 4^z×24/宽度，输出各 id 的 z/x/y 与半开 UTC 窗口。"
+        "另提供区域观测数上下界查询：对 /geo-anonymize 发布的 z/x/y 计数格"
+        "与经纬矩形查询区，完全落入的格计入两界、部分相交的格只计入上界、"
+        "不相交的不计入，并校验格编号、正计数与混合层级格重叠，"
+        "支持跨 180° 经线的查询区。"
     ),
-    version="1.4.0",
+    version="1.5.0",
 )
 
 
@@ -266,6 +272,78 @@ class SpacetimeAnonymizeResponse(BaseModel):
     total_records: int
 
 
+class GeoBoundsCell(BaseModel):
+    """一个 /geo-anonymize 发布格：z/x/y 与格内观测计数。"""
+
+    # 拒绝 bool 冒充整数；z/x/y 与 count 的取值范围在 prepare_cells 中校验。
+    z: StrictInt = Field(..., description="格层级（0～12）")
+    x: StrictInt = Field(..., description="格列号（0～2^z-1）")
+    y: StrictInt = Field(..., description="格行号，向北为 0（0～2^z-1）")
+    count: StrictInt = Field(..., description="该格公开发布的观测数（正整数）")
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class GeoBoundsRequest(BaseModel):
+    """区域观测数上下界查询请求体。"""
+
+    cells: list[GeoBoundsCell] = Field(
+        ..., description="/geo-anonymize 发布的 z/x/y 计数格列表"
+    )
+    lat_min: float = Field(..., description="查询区纬度下限（-90～90）")
+    lat_max: float = Field(..., description="查询区纬度上限（-90～90）")
+    lon_start: float = Field(
+        ...,
+        description="查询区经度起点（-180～180）；大于 lon_end 时按跨 180° 经线处理",
+    )
+    lon_end: float = Field(
+        ...,
+        description="查询区经度终点（-180～180）；lon_start > lon_end 时跨 180° 经线",
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator(
+        "lat_min", "lat_max", "lon_start", "lon_end", mode="before"
+    )
+    @classmethod
+    def _finite_number(cls, value: Any) -> Any:
+        """校验查询边界为有限数值：拒绝布尔、字符串与 NaN/无穷。
+
+        抛 HTTPException 以保持与其余接口一致的字符串型 422 detail；
+        具体范围与大小关系在端点中校验并给出中文错误信息。
+        """
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise unprocessable("查询区边界（纬度/经度）必须是数值")
+        result = float(value)
+        if not math.isfinite(result):
+            raise unprocessable("查询区边界（纬度/经度）必须是有限数值")
+        return result
+
+
+class GeoBoundsCellResult(BaseModel):
+    """单个发布格相对查询区的计数归属。"""
+
+    z: int
+    x: int
+    y: int
+    count: int
+    # inside=完全落入（计入两界）；partial=部分相交（仅计入上界）；
+    # outside=不相交（不计入）。
+    relation: str
+    lower_count: int
+    upper_count: int
+
+
+class GeoBoundsResponse(BaseModel):
+    """区域观测数上下界查询结果。"""
+
+    lower_bound: int
+    upper_bound: int
+    total_count: int
+    cells: list[GeoBoundsCellResult]
+
+
 @app.get("/")
 def root() -> dict[str, str]:
     """服务信息。"""
@@ -278,6 +356,7 @@ def root() -> dict[str, str]:
         "geo_anonymize": f"{API_PREFIX}/geo-anonymize",
         "time_anonymize": f"{API_PREFIX}/time-anonymize",
         "spacetime_anonymize": f"{API_PREFIX}/spacetime-anonymize",
+        "geo_count_bounds": f"{API_PREFIX}/geo-count-bounds",
     }
 
 
@@ -483,4 +562,54 @@ def spacetime_anonymize(request: SpacetimeAnonymizeRequest) -> SpacetimeAnonymiz
         max_zoom=request.max_zoom,
         max_window_hours=request.max_window_hours,
         total_records=len(request.records),
+    )
+
+
+@app.post(
+    f"{API_PREFIX}/geo-count-bounds",
+    response_model=GeoBoundsResponse,
+)
+def geo_count_bounds(request: GeoBoundsRequest) -> GeoBoundsResponse:
+    """对已发布的公开格计算经纬矩形查询区内区域观测数的下界与上界。
+
+    完全落入查询区的格计入下界与上界；与查询区部分相交（有正面积交叠）
+    的格只计入上界；仅边界接触或完全不相交的格不计入。lon_start > lon_end
+    时查询区按跨 180° 经线的两个经度区间处理。
+    """
+    if not -90.0 <= request.lat_min <= 90.0:
+        raise unprocessable("lat_min 必须在 -90 到 90 之间")
+    if not -90.0 <= request.lat_max <= 90.0:
+        raise unprocessable("lat_max 必须在 -90 到 90 之间")
+    if request.lat_min >= request.lat_max:
+        raise unprocessable(
+            f"查询区纬度必须为正高度区间：lat_min({request.lat_min}) 必须小于 "
+            f"lat_max({request.lat_max})"
+        )
+
+    if not -180.0 <= request.lon_start <= 180.0:
+        raise unprocessable("lon_start 必须在 -180 到 180 之间")
+    if not -180.0 <= request.lon_end <= 180.0:
+        raise unprocessable("lon_end 必须在 -180 到 180 之间")
+    # lon_start > lon_end：跨 180° 经线；相等时查询区宽度为零（既非普通区间
+    # 也无法判定为全球），无正面积，直接拒绝以免结果歧义。
+    if request.lon_start == request.lon_end:
+        raise unprocessable(
+            f"查询区经度宽度不能为零：lon_start 与 lon_end 不能相等"
+            f"（均为 {request.lon_start}）；需跨 180° 经线时请令 lon_start > lon_end"
+        )
+
+    prepared = prepare_cells([cell.model_dump() for cell in request.cells])
+    result = count_bounds(
+        prepared,
+        request.lat_min,
+        request.lat_max,
+        request.lon_start,
+        request.lon_end,
+    )
+
+    return GeoBoundsResponse(
+        lower_bound=result["lower_bound"],
+        upper_bound=result["upper_bound"],
+        total_count=result["total_count"],
+        cells=[GeoBoundsCellResult(**cell) for cell in result["cells"]],
     )

@@ -17,6 +17,10 @@
 宽度整除 24 且不超过上限的等宽小时窗组成联合组，枚举可行的 **(z, 宽度)**，
 仅保留每个非空联合组至少 **k** 条的方案并最大化 **4^z × 24/宽度**，
 输出各 id 的 `z/x/y` 与半开 UTC 窗口，替代直接公开精确坐标与时刻。
+此外还提供**区域观测数上下界查询**：提交一组 `geo-anonymize` 已发布的
+`z/x/y` 计数格与一个经纬矩形查询区，仅依据公开格计算区域内观测数的
+**下界与上界**——完全落入查询区的格计入两界、部分相交的格只计入上界、
+不相交的不计入，支持跨 180° 经线的查询区。
 
 服务为纯内存、无状态处理：**原始记录不写日志、不落盘、不挂载数据卷**。
 
@@ -32,6 +36,7 @@ docker compose up --build
 - 匿名化接口：`POST http://localhost:8000/api/v1/anonymize`
 - 两次发布关联风险审计接口：`POST http://localhost:8000/api/v1/audit-intersection`
 - 坐标自适应网格匿名化接口：`POST http://localhost:8000/api/v1/geo-anonymize`
+- 区域观测数上下界查询接口：`POST http://localhost:8000/api/v1/geo-count-bounds`
 - 观测时间窗口匿名化接口：`POST http://localhost:8000/api/v1/time-anonymize`
 - 时空联合匿名发布接口：`POST http://localhost:8000/api/v1/spacetime-anonymize`
 - 健康检查：`GET http://localhost:8000/api/v1/health`
@@ -367,7 +372,132 @@ curl -s http://localhost:8000/api/v1/geo-anonymize \
 - 坐标越界：纬度超出 -90～90 或经度超出 -180～180；
 - 请求体缺少必填字段或出现未声明字段。
 
-## 观测时间窗口匿名化
+## 区域观测数上下界查询
+
+`POST /api/v1/geo-count-bounds`，`Content-Type: application/json`。
+
+坐标网格匿名化只公开了每个格的 `z/x/y` 与人数，格内观测点的具体位置未知。
+当外部使用者想知道“某个经纬矩形区域内有多少观测”时，仅凭公开格无法给出
+准确值，只能给出**下界与上界**：
+
+- **完全落入**查询区的格：格内观测必在区内，计数**同时计入下界与上界**；
+- 与查询区**部分相交**（存在正面积交叠）的格：格内观测可能在区内，计数
+  **只计入上界**；
+- 与查询区**不相交**的格：不计入任何一界。
+
+因此区域真实观测数 `N` 满足 `lower_bound <= N <= upper_bound`。格的经纬
+边界沿用坐标网格接口的同一套规则（根格 -90～90、-180～180，按中点递归
+四分，`y` 向北为 0）。归属判定也遵守“边界点归入**最北、最东**子格”的
+约定，并以**正面积交叠**为准：格与查询区仅在一条边或一个点上接触时**不**
+计为相交，避免边界接触被误计。
+
+`lon_start > lon_end` 表示查询区**跨越 180° 经线**，服务自动拆成
+`[lon_start, 180]` 与 `[-180, lon_end]` 两个经度区间分别判定，再合并结果。
+
+### 请求格式
+
+```json
+{
+  "cells": [
+    {"z": 2, "x": 2, "y": 1, "count": 8},
+    {"z": 3, "x": 7, "y": 3, "count": 2},
+    {"z": 3, "x": 7, "y": 2, "count": 3},
+    {"z": 3, "x": 6, "y": 3, "count": 4},
+    {"z": 3, "x": 6, "y": 2, "count": 5},
+    {"z": 2, "x": 0, "y": 1, "count": 6}
+  ],
+  "lat_min": 5,
+  "lat_max": 45,
+  "lon_start": 5,
+  "lon_end": 180
+}
+```
+
+- `cells`：`/geo-anonymize` 发布的公开格列表（允许**混合层级**，例如同时
+  提交 z=2 与 z=3 的格），每项含：
+  - `z`：整数，`0～12`；
+  - `x` / `y`：该层合法格编号，取值 `0～2^z - 1`（`y` 向北为 0）；
+  - `count`：该格公开发布的观测数，必须为**正整数**。
+- 查询区为经纬矩形（边界均为 -90～90 / -180～180 内的有限数值）：
+  - `lat_min` / `lat_max`：纬度下限、上限，必须满足
+    `-90 <= lat_min < lat_max <= 90`；
+  - `lon_start` / `lon_end`：经度起点、终点。
+    - `lon_start < lon_end`：普通区间 `[lon_start, lon_end]`；
+    - `lon_start > lon_end`：**跨 180° 经线**，按 `[lon_start, 180]` 与
+      `[-180, lon_end]` 两段处理；
+    - 二者相等（宽度为零）返回 422。
+- 格列表可以为空，此时上下界均为 0。
+
+### 响应格式
+
+上例查询区为纬度 5～45、经度 5～180。两个 z=3 格 `(7,2)`（纬度
+22.5～45、经度 135～180）、`(6,2)`（同纬度、经度 90～135）完全落入；
+z=2 格 `(2,1)`（纬度 0～45、经度 0～90）被查询区的西、南两边界切到，
+z=3 格 `(7,3)`、`(6,3)`（纬度 0～22.5）被南边界 5° 切到，均只部分相交；
+z=2 格 `(0,1)`（经度 -180～-90）完全不相交：
+
+```json
+{
+  "lower_bound": 8,
+  "upper_bound": 22,
+  "total_count": 28,
+  "cells": [
+    {"z": 2, "x": 2, "y": 1, "count": 8, "relation": "partial",
+     "lower_count": 0, "upper_count": 8},
+    {"z": 3, "x": 7, "y": 3, "count": 2, "relation": "partial",
+     "lower_count": 0, "upper_count": 2},
+    {"z": 3, "x": 7, "y": 2, "count": 3, "relation": "inside",
+     "lower_count": 3, "upper_count": 3},
+    {"z": 3, "x": 6, "y": 3, "count": 4, "relation": "partial",
+     "lower_count": 0, "upper_count": 4},
+    {"z": 3, "x": 6, "y": 2, "count": 5, "relation": "inside",
+     "lower_count": 5, "upper_count": 5},
+    {"z": 2, "x": 0, "y": 1, "count": 6, "relation": "outside",
+     "lower_count": 0, "upper_count": 0}
+  ]
+}
+```
+
+- 每个格的归属 `relation`：
+  - `"inside"`：完全落入查询区，`lower_count = upper_count = count`；
+  - `"partial"`：与查询区正面积交叠但未完全落入，
+    `lower_count = 0`、`upper_count = count`；
+  - `"outside"`：不相交（含仅边界接触），两者均为 `0`。
+  各格按**输入顺序**返回。
+- `lower_bound`：所有 `inside` 格计数之和（区域观测数的下界）。
+- `upper_bound`：所有 `inside` 与 `partial` 格计数之和（上界）。
+- `total_count`：提交格的计数总和（与查询区无关，供核对）。
+
+仓库内 `examples/request-geo-count-bounds.json` 为可直接使用的示例：
+
+```bash
+curl -s http://localhost:8000/api/v1/geo-count-bounds \
+  -H 'Content-Type: application/json' \
+  --data @examples/request-geo-count-bounds.json
+```
+
+### 格重叠校验
+
+公开格在地理上必须**互不重叠**，否则同一观测会被重复计入上下界。服务除了
+拒绝完全相同的格编号外，还会校验**混合层级**的重叠：粗格与落在其内部的
+细格（祖先/后代关系）一律返回 422。仅在边上拼接的相邻格（含混合层级共边）
+不算重叠，允许提交。
+
+### 上下界接口的 422 校验
+
+以下情况返回 HTTP `422 Unprocessable Entity`（请求体结构错误同样为
+422），错误说明在响应体 `detail` 中：
+
+- 某个格的 `z` 不是整数或不在 0～12；
+- 某个格的 `x`/`y` 不是整数或超出该层合法范围 `0～2^z - 1`（格编号越界）；
+- 某个格的 `count` 不是正整数（含 `0`、负数、布尔值、小数）；
+- 两个格编号完全相同（重复格），或两个格（含混合层级）地理区域重叠；
+- 查询边界不是有限数值（含字符串、布尔值、`NaN`、无穷），或纬度/经度
+  超出 -90～90 / -180～180；
+- `lat_min >= lat_max`，或 `lon_start == lon_end`（零面积/零宽度查询区）；
+- 请求体或某个格缺少必填字段、出现未声明字段、或格不是 JSON 对象。
+
+
 
 `POST /api/v1/time-anonymize`，`Content-Type: application/json`。
 

@@ -17,6 +17,10 @@
 宽度整除 24 且不超过上限的等宽小时窗组成联合组，枚举可行的 **(z, 宽度)**，
 仅保留每个非空联合组至少 **k** 条的方案并最大化 **4^z × 24/宽度**，
 输出各 id 的 `z/x/y` 与半开 UTC 窗口，替代直接公开精确坐标与时刻。
+以及**公开格区域计数上下界**：给定一批 `/geo-anonymize` 已发布的
+`z/x/y` 格与各格计数，对任意经纬矩形查询区，仅依据公开格计算区域内
+观测数的**下界与上界**——完全落入查询区的格计入两界，仅部分相交的格
+只计入上界，不相交的格不计入。
 
 服务为纯内存、无状态处理：**原始记录不写日志、不落盘、不挂载数据卷**。
 
@@ -34,6 +38,7 @@ docker compose up --build
 - 坐标自适应网格匿名化接口：`POST http://localhost:8000/api/v1/geo-anonymize`
 - 观测时间窗口匿名化接口：`POST http://localhost:8000/api/v1/time-anonymize`
 - 时空联合匿名发布接口：`POST http://localhost:8000/api/v1/spacetime-anonymize`
+- 公开格区域计数上下界接口：`POST http://localhost:8000/api/v1/geo-count-bounds`
 - 健康检查：`GET http://localhost:8000/api/v1/health`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -570,6 +575,117 @@ curl -s http://localhost:8000/api/v1/spacetime-anonymize \
 - 全部记录转换到 UTC 后不在同一日历日期；
 - 不存在可行方案：任何 `(z, 宽度)` 组合下都存在不足 k 条的非空联合组
   （例如某条记录所在格与相邻时间窗内的记录合并后仍不足 k 条）；
+- 请求体缺少必填字段或出现未声明字段。
+
+## 公开格区域计数上下界
+
+`POST /api/v1/geo-count-bounds`，`Content-Type: application/json`。
+
+网格匿名化只公开了若干**混合层级**的 `z/x/y` 格与各格人数，并未公开
+精确坐标。本接口在**只使用这些公开格**的前提下回答“某个经纬矩形查询区
+内有多少条观测”，给出严格的计数范围：
+
+- **完全落入**查询区的格（`relation: "inside"`）：格内观测必然全部在区内，
+  其 `count` **同时计入下界与上界**；
+- **部分相交**的格（`relation: "partial"`）：格内观测可能只有部分在区内，
+  其 `count` **只计入上界**（下界不计）；
+- **不相交**的格（`relation: "outside"`）：其 `count` 两界都不计入。
+
+因此真实区域观测数必落在 `[lower_bound, upper_bound]` 内。格的实际覆盖
+边界与 `/geo-anonymize` 完全一致（逐层经纬中点），并按半开区间理解
+（经度 `[lon_min, lon_max)`、纬度 `[lat_min, lat_max)`，全球边界点
+±180/±90 并入唯一相邻格），所以两个格仅沿边界线接触时各自独立、
+查询区也**不会**把仅边界接触的格误计为相交。
+
+**跨 180° 经线查询**：当 `lon_min > lon_max` 时，查询区按两个经度区间
+`[lon_min, 180]` 与 `[-180, lon_max]` 的并集处理，响应中
+`cross_antimeridian` 为 `true` 并回显这两个区间。
+
+### 请求格式
+
+```json
+{
+  "cells": [
+    {"z": 8, "x": 206, "y": 82, "count": 2},
+    {"z": 8, "x": 201, "y": 84, "count": 2}
+  ],
+  "bounds": {
+    "lat_min": 30.0,
+    "lat_max": 33.0,
+    "lon_min": 100.0,
+    "lon_max": 115.0
+  }
+}
+```
+
+- `cells`：**至少 1 个**已发布格，允许来自不同层级（自适应四分的发布格
+  本就是混合层级）。每格只含：
+  - `z`：0～12 的整数；`x`、`y`：`0～2^z-1` 的整数（非法编号返回 422）；
+  - `count`：**正整数**，该格公开发布的观测数；
+  - 同一 `z/x/y` 不允许重复；不同层级的格之间若存在**正面积重叠**
+    （一个格的区域覆盖了另一个格的区域）返回 422——因为重叠区域的观测
+    会被重复计数；仅边界相接是合法的。
+- `bounds`：经纬矩形查询区，四个边界都必须是 -90～90 / -180～180 内的
+  **有限数值**，且必须为正面积矩形：`lat_min < lat_max`、
+  `lon_min != lon_max`。`lon_min > lon_max` 表示查询区跨 180° 经线。
+
+### 响应格式
+
+```json
+{
+  "cells": [
+    {"z": 8, "x": 206, "y": 82, "count": 2,
+     "relation": "inside", "lower_count": 2, "upper_count": 2},
+    {"z": 8, "x": 201, "y": 84, "count": 2,
+     "relation": "inside", "lower_count": 2, "upper_count": 2}
+  ],
+  "lower_bound": 4,
+  "upper_bound": 4,
+  "cross_antimeridian": false,
+  "longitude_intervals": [[100.0, 115.0]],
+  "total_cells": 2,
+  "total_count": 4
+}
+```
+
+- `cells`：与输入**等长、等序**，逐格给出计数归属：
+  - `relation`：`inside`（完全落入）/ `partial`（部分相交）/
+    `outside`（不相交，含仅边界接触）；
+  - `lower_count`：该格计入下界的计数（仅 inside 为 `count`，否则 `0`）；
+  - `upper_count`：该格计入上界的计数（inside/partial 为 `count`，
+    outside 为 `0`）。
+- `lower_bound` / `upper_bound`：区域观测数的下界与上界，分别为
+  `lower_count` / `upper_count` 之和。
+- `cross_antimeridian` / `longitude_intervals`：查询区是否跨 180° 经线，
+  以及归一化后的一个或两个查询经度区间。
+- `total_cells` / `total_count`：输入格数与全部格计数之和。
+
+例如查询区只切到某个格的一角时，该格为 `partial`：其人数不进下界、
+进上界，体现“公开格不足以确定区内确切人数，只能给出范围”。
+
+仓库内 `examples/request-geo-count-bounds.json` 为可直接使用的示例：
+
+```bash
+curl -s http://localhost:8000/api/v1/geo-count-bounds \
+  -H 'Content-Type: application/json' \
+  --data @examples/request-geo-count-bounds.json
+```
+
+### 区域计数接口的 422 校验
+
+以下情况返回 HTTP `422 Unprocessable Entity`（请求体结构错误同样为
+422），错误说明在响应体 `detail` 中：
+
+- `cells` 为空、缺失，或某一项不是对象；
+- 格字段缺失或多余：每项只能含 `z/x/y/count` 四个字段；
+- `z/x/y/count` 不是整数（含布尔值、浮点、字符串）；
+- `z` 超出 0～12，或 `x/y` 超出 `0～2^z-1`；
+- `count` 不是正整数（含 `0`、负数）；
+- 同一 `z/x/y` 格重复出现，或不同层级格之间存在正面积重叠；
+- `bounds` 缺失或不是对象，字段缺失或多余（恰为四个边界字段）；
+- 任一边界不是有限数值（含字符串、布尔值、`NaN`、无穷）或超出
+  纬度 -90～90、经度 -180～180；
+- 查询区为零面积矩形：`lat_min >= lat_max` 或 `lon_min == lon_max`；
 - 请求体缺少必填字段或出现未声明字段。
 
 ## 422 校验错误

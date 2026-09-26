@@ -18,6 +18,7 @@ from .anonymizer import (
     unprocessable,
 )
 from .geo import MAX_ZOOM_LIMIT, assign_cells, prepare_points
+from .geo_bounds import count_bounds, prepare_bounds, prepare_cells
 from .intersection import audit_intersections
 from .spacetime import assign_joint
 from .time_windows import MAX_WINDOW_HOURS_LIMIT, assign_windows, prepare_records
@@ -42,8 +43,12 @@ app = FastAPI(
         "对齐、宽度整除 24 且不超过上限的等宽小时窗组成联合组，"
         "枚举可行的 (z, 宽度)，仅保留每个非空联合组至少 k 条的方案，"
         "最大化 4^z×24/宽度，输出各 id 的 z/x/y 与半开 UTC 窗口。"
+        "另提供公开格区域计数上下界：接收一组已发布的 z/x/y 格与格内计数，"
+        "对经纬矩形查询区把格分为完全落入、部分相交、不相交三类，"
+        "分别汇总区域观测数的下界与上界；查询经度起点大于终点时按跨 180° "
+        "经线的两个区间处理。"
     ),
-    version="1.4.0",
+    version="1.5.0",
 )
 
 
@@ -266,6 +271,52 @@ class SpacetimeAnonymizeResponse(BaseModel):
     total_records: int
 
 
+class GeoCountBoundsRequest(BaseModel):
+    """公开格区域计数上下界请求体。"""
+
+    # /geo-anonymize 发布的格：每项为 z/x/y 与正整数 count，允许混合层级。
+    cells: list[dict[str, Any]] = Field(
+        ..., description="已公开发布的格列表，每项只含 z/x/y 与正整数 count"
+    )
+    bounds: dict[str, Any] = Field(
+        ...,
+        description=(
+            "经纬矩形查询区 lat_min/lat_max/lon_min/lon_max；"
+            "lon_min > lon_max 表示跨 180° 经线"
+        ),
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class GeoCellCount(BaseModel):
+    """一个发布格相对查询区的计数归属。"""
+
+    z: int
+    x: int
+    y: int
+    count: int
+    # inside=完全落入（计入下界与上界）、partial=部分相交（仅计入上界）、
+    # outside=不相交（均不计入；仅边界接触同样为 outside）。
+    relation: str
+    lower_count: int
+    upper_count: int
+
+
+class GeoCountBoundsResponse(BaseModel):
+    """公开格区域计数上下界结果。"""
+
+    cells: list[GeoCellCount]
+    lower_bound: int
+    upper_bound: int
+    # 查询区是否按跨 180° 经线的两个经度区间处理。
+    cross_antimeridian: bool
+    # 归一化后的查询经度区间；跨 180° 时为两个区间，否则为一个。
+    longitude_intervals: list[list[float]]
+    total_cells: int
+    total_count: int
+
+
 @app.get("/")
 def root() -> dict[str, str]:
     """服务信息。"""
@@ -278,6 +329,7 @@ def root() -> dict[str, str]:
         "geo_anonymize": f"{API_PREFIX}/geo-anonymize",
         "time_anonymize": f"{API_PREFIX}/time-anonymize",
         "spacetime_anonymize": f"{API_PREFIX}/spacetime-anonymize",
+        "geo_count_bounds": f"{API_PREFIX}/geo-count-bounds",
     }
 
 
@@ -483,4 +535,33 @@ def spacetime_anonymize(request: SpacetimeAnonymizeRequest) -> SpacetimeAnonymiz
         max_zoom=request.max_zoom,
         max_window_hours=request.max_window_hours,
         total_records=len(request.records),
+    )
+
+
+@app.post(
+    f"{API_PREFIX}/geo-count-bounds",
+    response_model=GeoCountBoundsResponse,
+)
+def geo_count_bounds(request: GeoCountBoundsRequest) -> GeoCountBoundsResponse:
+    """仅依据已发布的 z/x/y 格与格内计数，计算经纬矩形查询区的观测数上下界。"""
+    cells = prepare_cells(request.cells)
+    bounds = prepare_bounds(request.bounds)
+
+    lower_bound, upper_bound, results = count_bounds(cells, bounds)
+
+    lat_min, lat_max, lon_min, lon_max = bounds
+    cross_antimeridian = lon_min > lon_max
+    if cross_antimeridian:
+        longitude_intervals = [[lon_min, 180.0], [-180.0, lon_max]]
+    else:
+        longitude_intervals = [[lon_min, lon_max]]
+
+    return GeoCountBoundsResponse(
+        cells=[GeoCellCount(**cell) for cell in results],
+        lower_bound=lower_bound,
+        upper_bound=upper_bound,
+        cross_antimeridian=cross_antimeridian,
+        longitude_intervals=longitude_intervals,
+        total_cells=len(cells),
+        total_count=sum(cell[3] for cell in cells),
     )
